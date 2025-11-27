@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 from __future__ import annotations
 
 import argparse
@@ -48,6 +49,25 @@ def parse_args() -> argparse.Namespace:
         type=pathlib.Path,
         default=pathlib.Path("models"),
         help="Directory containing model files (default: models)",
+    )
+
+    parser.add_argument(
+        "--prefixes",
+        type=pathlib.Path,
+        default=pathlib.Path("prefixes.txt"),
+        help="Path to target prefixes file (default: prefixes.txt)",
+    )
+
+    parser.add_argument(
+        "--loading-strategy",
+        type=str,
+        choices=["sequential", "batch"],
+        default="sequential",
+        help=(
+            "Model loading strategy: "
+            "'sequential' = load/unload models one by one (memory efficient), "
+            "'batch' = load all models at once (faster, requires more VRAM)"
+        ),
     )
 
     parser.add_argument(
@@ -155,6 +175,7 @@ def gen_response(
     question_id: str,
     log: logger.loguru.Logger,
     is_adversarial: bool = False,
+    loading_strategy: t.Literal["sequential", "batch"] = "sequential",
 ) -> dict[str, str]:
     """Generate responses from all models.
 
@@ -165,6 +186,7 @@ def gen_response(
         question_id: Question identifier.
         log: Logger instance.
         is_adversarial: Whether this is an adversarial image.
+        loading_strategy: "sequential" or "batch" loading.
 
     Returns:
         Dictionary mapping model names to responses.
@@ -172,10 +194,19 @@ def gen_response(
     responses = {}
     wrapper_names = ["InstructBLIP", "LLaVA", "Qwen"]
 
+    if loading_strategy == "batch":
+        # Load all models at once
+        for wrapper in wrappers:
+            wrapper.load()
+
     for wrapper, name in zip(wrappers, wrapper_names, strict=False):
-        wrapper.load()
+        if loading_strategy == "sequential":
+            wrapper.load()
+
         response = wrapper.generate(image, text)
-        wrapper.unload()
+
+        if loading_strategy == "sequential":
+            wrapper.unload()
 
         responses[name] = response
 
@@ -189,7 +220,59 @@ def gen_response(
             )
         ).info("")
 
+    if loading_strategy == "batch":
+        # Unload all models at once
+        for wrapper in wrappers:
+            wrapper.unload()
+
     return responses
+
+
+def run_attack_sequential(attack: PGD, image: torch.Tensor, text: str) -> torch.Tensor:
+    """Run attack with sequential model loading (original
+    implementation).
+
+    Args:
+        attack: PGD attack instance.
+        image: Original image.
+        text: Text prompt.
+
+    Returns:
+        Adversarial image.
+    """
+    return attack.attack(image, text, verbose=False)
+
+
+def run_attack_batch(attack: PGD, image: torch.Tensor, text: str) -> torch.Tensor:
+    """Run attack with batch model loading (all models stay loaded).
+
+    Args:
+        attack: PGD attack instance.
+        image: Original image.
+        text: Text prompt.
+
+    Returns:
+        Adversarial image.
+    """
+    original_image = image.clone().detach()
+    x = original_image.clone()
+
+    # Load all models at once
+    for wrapper in attack.wrappers:
+        wrapper.load()
+
+    # Run attack rounds
+    for _round_idx in range(attack.num_rounds):
+        for wrapper in attack.wrappers:
+            # Models are already loaded, just run PGD steps
+            for _step in range(attack.steps_per_model):
+                x = attack._pgd_step(x, original_image, text, wrapper)
+
+    # Unload all models at once
+    for wrapper in attack.wrappers:
+        wrapper.unload()
+
+    return x
 
 
 def main() -> None:
@@ -200,6 +283,7 @@ def main() -> None:
     display.header("Adversarial Attack Pipeline")
     display.info(f"Input directory: {args.input}")
     display.info(f"Output directory: {args.output}")
+    display.info(f"Loading strategy: {args.loading_strategy}")
 
     dirs = setup_dirs(args.output)
     display.success(f"Created output directory: {dirs['run']}")
@@ -208,29 +292,56 @@ def main() -> None:
     log = logger.setup_logger(dirs["run"] / "log.jsonl")
     display.success("Initialized logger")
 
+    # Load prefixes
+    display.step("Loading target prefixes", 1)
+    try:
+        prefixes = loader.load_prefixes(args.prefixes)
+        display.success(f"Loaded {len(prefixes)} target prefixes from {args.prefixes}")
+
+        # Save loaded prefixes to output for reference
+        prefixes_output = dirs["run"] / "prefixes_used.txt"
+        with prefixes_output.open("w", encoding="utf-8") as f:
+            f.write("\n".join(prefixes))
+        display.info(f"Saved prefixes to: {prefixes_output}")
+
+    except (FileNotFoundError, ValueError) as e:
+        display.error(f"Failed to load prefixes: {e}")
+        display.warning("Falling back to default prefixes")
+        from advattacks.prefixes import DEFAULT_PREFIXES
+
+        prefixes = DEFAULT_PREFIXES
+        display.info(f"Using {len(prefixes)} default prefixes")
+
     # Load dataset
-    display.step("Loading dataset", 1)
+    display.step("Loading dataset", 2)
     samples = loader.load_dataset(args.input)
     display.success(f"Loaded {len(samples)} samples")
 
     # Initialize wrappers
-    display.step("Initializing model wrappers", 2)
+    display.step("Initializing model wrappers", 3)
     wrappers = init_wrappers(args.models_dir)
     display.success(f"Initialized {len(wrappers)} model wrappers")
 
     # Initialize attack
-    display.step("Creating attack", 3)
+    display.step("Creating attack", 4)
     attack = PGD(
         wrappers=wrappers,
         epsilon=args.epsilon,
         alpha=args.alpha,
         num_rounds=args.rounds,
         steps_per_model=args.steps_per_model,
+        prefixes=prefixes,  # Pass loaded prefixes
     )
-    display.success("Initialized PGD attack")
+
+    total_steps = args.rounds * len(wrappers) * args.steps_per_model
+    display.success(
+        f"Initialized PGD attack "
+        f"(ε={args.epsilon:. 4f}, α={args.alpha:. 4f}, "
+        f"{args.rounds} rounds × {len(wrappers)} models × {args.steps_per_model} steps = {total_steps} total steps)"
+    )
 
     # Process each sample
-    display.step("Running attacks", 4)
+    display.step("Running attacks", 5)
     print()
 
     all_metrics: list[ComparisonMetrics] = []
@@ -258,7 +369,12 @@ def main() -> None:
         start_time = time.time()
 
         try:
-            adversarial_image = attack(original_image, question, verbose=False)
+            # Choose attack method based on loading strategy
+            if args.loading_strategy == "sequential":
+                adversarial_image = run_attack_sequential(attack, original_image, question)
+            else:  # batch
+                adversarial_image = run_attack_batch(attack, original_image, question)
+
             duration = time.time() - start_time
 
             final_linf = torch.norm(adversarial_image - original_image, p=float("inf")).item()
@@ -303,6 +419,7 @@ def main() -> None:
                     question_id,
                     log,
                     is_adversarial=False,
+                    loading_strategy=args.loading_strategy,
                 )
 
                 # Adversarial responses
@@ -313,6 +430,7 @@ def main() -> None:
                     question_id,
                     log,
                     is_adversarial=True,
+                    loading_strategy=args.loading_strategy,
                 )
 
                 # Save responses
@@ -378,7 +496,7 @@ def main() -> None:
 
     # Save metrics summary
     if all_metrics:
-        display.step("Saving metrics summary", 5)
+        display.step("Saving metrics summary", 6)
         metrics_path = dirs["metrics"] / "metrics. json"
         with metrics_path.open("w", encoding="utf-8") as f:
             json.dump(all_metrics, f, indent=2)
@@ -394,6 +512,12 @@ def main() -> None:
     display.header("Pipeline Complete")
     display.success(f"Processed {len(samples)} samples")
     display.info(f"Results saved to: {dirs['run']}")
+
+    if all_metrics:
+        avg_linf = sum(m["linf_norm"] for m in all_metrics) / len(all_metrics)
+        constraint_satisfied = sum(1 for m in all_metrics if m["linf_norm"] <= args.epsilon)
+        display.info(f"Average L∞ norm: {avg_linf:.6f}")
+        display.info(f"Constraint satisfied: {constraint_satisfied}/{len(all_metrics)}")
 
 
 if __name__ == "__main__":
