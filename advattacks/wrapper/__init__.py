@@ -20,17 +20,24 @@ class Wrapper(abc.ABC):
     Attributes:
         model: The underlying vision-language model.
         processor: The model's processor for input preparation and decoding.
+        tokenizer: The model's tokenizer for text processing.
 
     Args:
         model_path: Path to the pretrained model.
         device: Device to load model on.  Defaults to CUDA if available.
     """
 
+    model: nn.Module | None
+    processor: tfs.ProcessorMixin | None
+    tokenizer: tfs.PreTrainedTokenizer | None
+    _is_loaded: bool
+
     def __init__(self, model_path: str | os.PathLike[str], device: torch.device | None = None):
         self.model_path = pathlib.Path(model_path)
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model: nn.Module | None = None
         self.processor: tfs.ProcessorMixin | None = None
+        self.tokenizer: tfs.PreTrainedTokenizer | None = None
         self._is_loaded = False
 
     @abc.abstractmethod

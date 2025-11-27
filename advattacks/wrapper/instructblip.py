@@ -9,17 +9,24 @@ from advattacks.wrapper import Wrapper
 
 
 class InstructBlipWrapper(Wrapper):
+    model: tfs.InstructBlipForConditionalGeneration | None
+    processor: tfs.InstructBlipProcessor | None
+    tokenizer: tfs.GPT2Tokenizer | None  # InstructBlip uses GPT2Tokenizer
+
     def __init__(self, model_path: str | pathlib.Path, device: torch.device | None = None):
         super().__init__(model_path, device)
-        self.model: tfs.InstructBlipForConditionalGeneration | None = None
-        self.processor: tfs.InstructBlipProcessor | None = None
-        self._is_loaded = False
 
     def load(self) -> None:
         if self._is_loaded:
             return
 
         self.processor = tfs.InstructBlipProcessor.from_pretrained(
+            self.model_path,
+            use_fast=True,
+            padding_side="left",
+        )
+
+        self.tokenizer = tfs.AutoTokenizer.from_pretrained(
             self.model_path,
             use_fast=True,
             padding_side="left",

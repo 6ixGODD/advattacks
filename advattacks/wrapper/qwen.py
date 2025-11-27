@@ -10,13 +10,12 @@ from advattacks.wrapper import Wrapper
 
 
 class QwenWrapper(Wrapper):
-    """Wrapper for Qwen2.5-VL-7B-Instruct model."""
+    model: tfs.Qwen2_5_VLForConditionalGeneration | None
+    processor: tfs.Qwen2_5_VLProcessor | None
+    tokenizer: tfs.Qwen2Tokenizer | None
 
     def __init__(self, model_path: str | pathlib.Path, device: torch.device | None = None):
         super().__init__(model_path, device)
-        self.model: tfs.Qwen2_5_VLForConditionalGeneration | None = None
-        self.processor: tfs.Qwen2_5_VLProcessor | None = None
-        self._is_loaded = False
 
     def load(self) -> None:
         if self._is_loaded:
@@ -27,6 +26,12 @@ class QwenWrapper(Wrapper):
             use_fast=True,
             legacy=False,
             trust_remote_code=True,
+        )
+
+        self.tokenizer = tfs.AutoTokenizer.from_pretrained(
+            self.model_path,
+            use_fast=True,
+            padding_side="left",
         )
 
         self.model = tfs.Qwen2_5_VLForConditionalGeneration.from_pretrained(
