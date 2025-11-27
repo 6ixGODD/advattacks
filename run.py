@@ -110,6 +110,12 @@ def parse_args() -> argparse.Namespace:
         help="Skip visualization generation",
     )
 
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose logging",
+    )
+
     return parser.parse_args()
 
 
@@ -228,7 +234,9 @@ def gen_response(
     return responses
 
 
-def run_attack_sequential(attack: PGD, image: torch.Tensor, text: str) -> torch.Tensor:
+def run_attack_sequential(
+    attack: PGD, image: torch.Tensor, text: str, verbose: bool
+) -> torch.Tensor:
     """Run attack with sequential model loading (original
     implementation).
 
@@ -236,11 +244,12 @@ def run_attack_sequential(attack: PGD, image: torch.Tensor, text: str) -> torch.
         attack: PGD attack instance.
         image: Original image.
         text: Text prompt.
+        verbose: Whether to enable verbose logging.
 
     Returns:
         Adversarial image.
     """
-    return attack.attack(image, text, verbose=False)
+    return attack.attack(image, text, verbose=verbose)
 
 
 def run_attack_batch(attack: PGD, image: torch.Tensor, text: str) -> torch.Tensor:
@@ -371,7 +380,9 @@ def main() -> None:
         try:
             # Choose attack method based on loading strategy
             if args.loading_strategy == "sequential":
-                adversarial_image = run_attack_sequential(attack, original_image, question)
+                adversarial_image = run_attack_sequential(
+                    attack, original_image, question, args.verbose
+                )
             else:  # batch
                 adversarial_image = run_attack_batch(attack, original_image, question)
 
