@@ -34,7 +34,7 @@ def load_dataset(data_dir: pathlib.Path) -> list[DataSample]:
     to_tensor = transforms.ToTensor()
 
     # Iterate through all JSON files in questions directory
-    for json_file in sorted(questions_dir.glob("*. json")):
+    for json_file in sorted(questions_dir.glob("*.json")):
         scenario = json_file.stem  # e.g., "01-Illegal_Activity"
 
         # Load questions
