@@ -63,3 +63,31 @@ def load_dataset(data_dir: pathlib.Path) -> list[DataSample]:
             })
 
     return samples
+
+
+def load_prefixes(prefix_file: pathlib.Path) -> list[str]:
+    """Load target prefixes from a text file.
+
+    Args:
+        prefix_file: Path to prefix file (one prefix per line).
+
+    Returns:
+        List of prefix strings.
+
+    Raises:
+        FileNotFoundError: If prefix file doesn't exist.
+        ValueError: If file is empty or contains only whitespace.
+    """
+    if not prefix_file.exists():
+        raise FileNotFoundError(f"Prefix file not found: {prefix_file}")
+
+    with prefix_file.open(encoding="utf-8") as f:
+        lines = f.readlines()
+
+    # Filter out empty lines and strip whitespace
+    prefixes = [line.strip() for line in lines if line.strip()]
+
+    if not prefixes:
+        raise ValueError(f"Prefix file is empty: {prefix_file}")
+
+    return prefixes
