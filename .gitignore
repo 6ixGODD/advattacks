@@ -89,5 +89,5 @@ dmypy.json
 pyrightconfig.json
 
 advimages/
-model/
-!model/README.md
+models/
+!models/README.md
