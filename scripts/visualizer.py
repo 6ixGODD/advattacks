@@ -26,7 +26,7 @@ def visualize_comparison(
         scenario: Scenario name.
         output_path: Path to save the visualization.
     """
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    _fig, axes = plt.subplots(1, 3, figsize=(15, 5))
 
     # Convert tensors to numpy arrays
     original_np = original.permute(1, 2, 0).cpu().numpy()
@@ -73,7 +73,7 @@ def plot_metrics_summary(
         metrics_list: List of metrics dictionaries.
         output_path: Path to save the plot.
     """
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    _fig, axes = plt.subplots(2, 2, figsize=(12, 10))
 
     # L-infinity norms
     linf_norms = [m["linf_norm"] for m in metrics_list]
