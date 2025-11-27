@@ -87,3 +87,7 @@ dmypy.json
 
 # LSP config files
 pyrightconfig.json
+
+advimages/
+model/
+!model/README.md
