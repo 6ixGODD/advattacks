@@ -6,11 +6,7 @@ import torch
 
 from advattacks import utils
 from advattacks.attack import Attack
-from advattacks.loss import CompositeLoss
-from advattacks.loss import CovertLoss
-from advattacks.loss import TargetLoss
 from advattacks.prefixes import DEFAULT_PREFIXES
-from advattacks.prefixes import tokenize_prefixes
 
 if t.TYPE_CHECKING:
     from advattacks.wrapper import Wrapper
@@ -20,9 +16,12 @@ class PGD(Attack):
     """Projected Gradient Descent attack with round-robin model loading.
 
     Implements the iterative attack:
-        1. g_t = ∇_x L(x_t)
-        2. x̃_{t+1} = x_t - α * sign(g_t)
-        3. x_{t+1} = clip(x̃_{t+1}, x_0 - ε, x_0 + ε) ∩ [0, 1]
+        1.g_t = ∇_x L(x_t)
+        2.x̃_{t+1} = x_t - α * sign(g_t)
+        3.x_{t+1} = clip(x̃_{t+1}, x_0 - ε, x_0 + ε) ∩ [0, 1]
+
+    Uses teacher-forcing loss to optimize for target prefix generation across
+    multiple vision-language models with round-robin loading strategy.
 
     Args:
         wrappers: Sequence of model wrappers to attack.
@@ -30,8 +29,7 @@ class PGD(Attack):
         alpha: Step size for each PGD iteration (default: 2/255).
         num_rounds: Number of complete rounds through all models.
         steps_per_model: Number of PGD steps per model per round.
-        lambda_target: Weight for target loss.
-        lambda_inf: Weight for covert loss.
+        lambda_inf: Weight for L-infinity regularization (default: 0.01).
         prefixes: Sequence of target prefix strings for jailbreak.
     """
 
@@ -42,7 +40,6 @@ class PGD(Attack):
         alpha: float = 2 / 255,
         num_rounds: int = 4,
         steps_per_model: int = 5,
-        lambda_target: float = 1.0,
         lambda_inf: float = 0.01,
         prefixes: t.Sequence[str] | None = None,
     ):
@@ -50,69 +47,96 @@ class PGD(Attack):
         self.alpha = alpha
         self.num_rounds = num_rounds
         self.steps_per_model = steps_per_model
-        self.lambda_target = lambda_target
         self.lambda_inf = lambda_inf
 
         if self.prefixes is None:
             self.prefixes = DEFAULT_PREFIXES
 
-        # Cache for tokenized prefixes per wrapper
-        self._tokenized_cache: dict[Wrapper, list[torch.Tensor]] = {}
+    def _compute_composite_loss(
+        self,
+        image: torch.Tensor,
+        original_image: torch.Tensor,
+        question: str,
+        wrapper: Wrapper,
+    ) -> torch.Tensor:
+        """Compute composite loss combining teacher-forcing and
+        L-infinity penalty.
 
-    def _get_tokenized_prefixes(self, wrapper: Wrapper) -> list[torch.Tensor]:
-        """Get or compute tokenized prefixes for a wrapper.
+        The composite loss encourages target prefix generation while penalizing
+        large perturbations:
+            L = (1/K) * Σ L_tf(prefix_k) + λ_inf * ||x - x_0||_inf
 
         Args:
-            wrapper: Model wrapper.
+            image: Current perturbed image.
+            original_image: Original clean image.
+            question: Input question/prompt.
+            wrapper: Model wrapper to compute loss with.
 
         Returns:
-            List of tokenized prefix tensors.
+            Scalar composite loss tensor.
         """
-        if wrapper not in self._tokenized_cache:
-            self._tokenized_cache[wrapper] = tokenize_prefixes(self.prefixes, wrapper)
-        return self._tokenized_cache[wrapper]
+        total_tfloss = 0.0
+        valid_prefixes = 0
+
+        # Compute teacher-forcing loss for each target prefix
+        for prefix in self.prefixes:
+            try:
+                tfloss = wrapper.compute_tfloss(image, question, prefix)
+                total_tfloss += tfloss
+                valid_prefixes += 1
+            except Exception as e:
+                # Skip failed prefixes but log warning
+                print(f"Warning: Failed to compute loss for prefix '{prefix}': {e}")
+                continue
+
+        # Average teacher-forcing loss across prefixes
+        if valid_prefixes > 0:
+            avg_tfloss = total_tfloss / valid_prefixes
+        else:
+            # Fallback if all prefixes failed
+            avg_tfloss = torch.tensor(0.0, device=image.device)
+
+        # L-infinity regularization penalty
+        linf_penalty = torch.norm(image - original_image, p=float("inf"))
+
+        # Composite loss
+        return avg_tfloss + self.lambda_inf * linf_penalty
 
     def _pgd_step(
         self,
         image: torch.Tensor,
         original_image: torch.Tensor,
-        text: str,
+        question: str,
         wrapper: Wrapper,
     ) -> torch.Tensor:
         """Perform a single PGD update step.
 
+        Computes gradient of composite loss w.r.t.image and applies PGD update
+        with projection to epsilon-ball and valid pixel range.
+
         Args:
             image: Current perturbed image.
             original_image: Original clean image.
-            text: Text prompt.
+            question: Input question/prompt.
             wrapper: Model wrapper to compute gradient against.
 
         Returns:
-            Updated perturbed image.
+            Updated perturbed image after PGD step.
         """
-        # Get tokenized prefixes for this wrapper
-        target_token_ids = self._get_tokenized_prefixes(wrapper)
+        # Enable gradient computation for image
+        image_adv = image.clone().detach().requires_grad_(True)
 
-        # Construct loss functions
-        target_loss = TargetLoss([wrapper], target_token_ids)
-        covert_loss = CovertLoss(original_image)
-        composite_loss = CompositeLoss(
-            target_loss,
-            covert_loss,
-            self.lambda_target,
-            self.lambda_inf,
-        )
+        # Compute composite loss
+        loss = self._compute_composite_loss(image_adv, original_image, question, wrapper)
 
         # Compute gradient
-        image_adv = image.clone().detach().requires_grad_(True)
-        loss = composite_loss(image_adv, text)
         grad = torch.autograd.grad(loss, image_adv)[0]
 
-        # PGD update: x - alpha * sign(grad)
+        # PGD update: x - alpha * sign(∇L)
         normalized_grad = utils.normalize_gradient(grad)
         image_updated = image_adv - self.alpha * normalized_grad
 
-        # Project back to epsilon-ball and [0, 1]
+        # Project back to epsilon-ball and [0, 1] pixel range
         image_projected = utils.project_linf(
             image_updated,
             original_image,
@@ -124,13 +148,17 @@ class PGD(Attack):
     def attack(self, image: torch.Tensor, text: str, verbose: bool = True) -> torch.Tensor:
         """Run PGD attack with round-robin model loading.
 
+        Performs multi-round optimization across all models using sequential
+        loading to minimize memory usage. Each model is loaded, optimized for
+        several steps, then unloaded before moving to the next.
+
         Args:
             image: Original clean image tensor of shape (C, H, W) in [0, 1] range.
-            text: Text prompt.
-            verbose: Whether to print progress.
+            text: Text prompt/question.
+            verbose: Whether to print progress information.
 
         Returns:
-            Adversarial image tensor.
+            Adversarial image tensor with same shape as input.
         """
         original_image = image.clone().detach()
         x = original_image.clone()
@@ -143,7 +171,7 @@ class PGD(Attack):
                 print(f"\n=== Round {round_idx + 1}/{self.num_rounds} ===")
 
             for wrapper_idx, wrapper in enumerate(self.wrappers):
-                # Load model
+                # Load model into memory
                 if verbose:
                     print(f"  Loading model {wrapper_idx + 1}/{len(self.wrappers)}...")
                 wrapper.load()
@@ -162,10 +190,11 @@ class PGD(Attack):
                     print(f"  Unloading model {wrapper_idx + 1}...")
                 wrapper.unload()
 
+        # Final statistics
         if verbose:
             final_linf = torch.norm(x - original_image, p=float("inf")).item()
             print("\n=== Attack Complete ===")
-            print(f"Final L∞ norm: {final_linf:. 6f}")
+            print(f"Final L∞ norm: {final_linf:.6f}")
             print(f"Epsilon constraint: {self.epsilon:.6f}")
             print(f"Constraint satisfied: {final_linf <= self.epsilon}")
 
