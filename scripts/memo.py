@@ -16,3 +16,7 @@ def monitor_during_attack():
     while True:
         print_memory_usage()
         time.sleep(5)
+
+
+if __name__ == "__main__":
+    monitor_during_attack()
