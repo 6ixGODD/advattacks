@@ -151,7 +151,7 @@ def init_wrappers(models_dir: pathlib.Path) -> list[t.Any]:
     return [
         InstructBlipWrapper(models_dir / "Salesforce" / "instructblip-vicuna-7b"),
         LlavaWrapper(models_dir / "llava-hf" / "llava-1.5-7b-hf"),
-        QwenWrapper(models_dir / "Qwen" / "Qwen2. 5-VL-7B-Instruct"),
+        QwenWrapper(models_dir / "Qwen" / "Qwen2.5-VL-7B-Instruct"),
     ]
 
 
@@ -336,7 +336,7 @@ def main() -> None:
     total_steps = args.rounds * len(wrappers) * args.steps_per_model
     display.success(
         f"Initialized PGD attack "
-        f"(ε={args.epsilon:. 4f}, α={args.alpha:. 4f}, "
+        f"(ε={args.epsilon:.4f}, α={args.alpha:.4f}, "
         f"{args.rounds} rounds × {len(wrappers)} models × {args.steps_per_model} steps = {total_steps} total steps)"
     )
 
@@ -497,14 +497,14 @@ def main() -> None:
     # Save metrics summary
     if all_metrics:
         display.step("Saving metrics summary", 6)
-        metrics_path = dirs["metrics"] / "metrics. json"
+        metrics_path = dirs["metrics"] / "metrics.json"
         with metrics_path.open("w", encoding="utf-8") as f:
             json.dump(all_metrics, f, indent=2)
         display.success(f"Saved metrics: {metrics_path}")
 
         # Create summary visualization
         if not args.skip_visualization:
-            summary_plot_path = dirs["metrics"] / "summary. png"
+            summary_plot_path = dirs["metrics"] / "summary.png"
             visualizer.plot_metrics_summary(all_metrics, summary_plot_path)
             display.success(f"Saved summary plot: {summary_plot_path}")
 
