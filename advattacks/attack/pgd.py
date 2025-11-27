@@ -33,6 +33,8 @@ class PGD(Attack):
         prefixes: Sequence of target prefix strings for jailbreak.
     """
 
+    MAX_CONCURRENT_PREFIXES = 5
+
     def __init__(
         self,
         wrappers: t.Sequence[Wrapper],
@@ -78,28 +80,38 @@ class PGD(Attack):
         total_tfloss = 0.0
         valid_prefixes = 0
 
-        # Compute teacher-forcing loss for each target prefix
-        for prefix in self.prefixes:
-            try:
-                tfloss = wrapper.compute_tfloss(image, question, prefix)
-                total_tfloss += tfloss
-                valid_prefixes += 1
-            except Exception as e:
-                # Skip failed prefixes but log warning
-                print(f"Warning: Failed to compute loss for prefix '{prefix}': {e}")
-                continue
+        for i in range(0, len(self.prefixes), self.MAX_CONCURRENT_PREFIXES):
+            batch_prefixes = self.prefixes[i : i + self.MAX_CONCURRENT_PREFIXES]
 
-        # Average teacher-forcing loss across prefixes
+            for prefix in batch_prefixes:
+                try:
+                    tfloss = wrapper.compute_tfloss(image, question, prefix)
+                    total_tfloss += tfloss.item()
+                    valid_prefixes += 1
+
+                    del tfloss
+
+                except torch.cuda.OutOfMemoryError:
+                    print(f"Warning: OOM for prefix '{prefix}', skipping...")
+                    torch.cuda.empty_cache()
+                    continue
+                except Exception as e:
+                    print(f"Warning: Failed to compute loss for prefix '{prefix}': {e}")
+                    continue
+
+            torch.cuda.empty_cache()
+
+        # Batch average teacher-forcing loss
         if valid_prefixes > 0:
-            avg_tfloss = total_tfloss / valid_prefixes
+            avg_tfloss = torch.tensor(
+                total_tfloss / valid_prefixes, device=image.device, requires_grad=True
+            )
         else:
-            # Fallback if all prefixes failed
-            avg_tfloss = torch.tensor(0.0, device=image.device)
+            avg_tfloss = torch.tensor(0.0, device=image.device, requires_grad=True)
 
-        # L-infinity regularization penalty
+        # L-infinity penalty
         linf_penalty = torch.norm(image - original_image, p=float("inf"))
 
-        # Composite loss
         return avg_tfloss + self.lambda_inf * linf_penalty
 
     def _pgd_step(
@@ -126,24 +138,41 @@ class PGD(Attack):
         # Enable gradient computation for image
         image_adv = image.clone().detach().requires_grad_(True)
 
-        # Compute composite loss
-        loss = self._compute_composite_loss(image_adv, original_image, question, wrapper)
+        try:
+            # Compute composite loss
+            loss = self._compute_composite_loss(image_adv, original_image, question, wrapper)
 
-        # Compute gradient
-        grad = torch.autograd.grad(loss, image_adv)[0]
+            # Compute gradient
+            grad = torch.autograd.grad(loss, image_adv, create_graph=False)[0]
 
-        # PGD update: x - alpha * sign(∇L)
-        normalized_grad = utils.normalize_gradient(grad)
-        image_updated = image_adv - self.alpha * normalized_grad
+            # PGD update
+            normalized_grad = utils.normalize_gradient(grad)
+            image_updated = image_adv - self.alpha * normalized_grad
 
-        # Project back to epsilon-ball and [0, 1] pixel range
-        image_projected = utils.project_linf(
-            image_updated,
-            original_image,
-            self.epsilon,
-        )
+            # Project back to constraints
+            image_projected = utils.project_linf(
+                image_updated,
+                original_image,
+                self.epsilon,
+            )
 
-        return image_projected.detach()
+            result = image_projected.detach()
+
+        finally:
+            if "loss" in locals():
+                del loss
+            if "grad" in locals():
+                del grad
+            if "image_adv" in locals():
+                del image_adv
+            if "normalized_grad" in locals():
+                del normalized_grad
+            if "image_updated" in locals():
+                del image_updated
+            if "image_projected" in locals():
+                del image_projected
+            torch.cuda.empty_cache()
+        return result
 
     def attack(self, image: torch.Tensor, text: str, verbose: bool = True) -> torch.Tensor:
         """Run PGD attack with round-robin model loading.

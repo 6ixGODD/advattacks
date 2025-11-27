@@ -59,9 +59,23 @@ class Wrapper(abc.ABC):
     def load(self) -> None:
         """Load model and processor into memory."""
 
-    @abc.abstractmethod
     def unload(self) -> None:
         """Unload model and free GPU memory."""
+        if not self._is_loaded:
+            return
+
+        del self.model
+        del self.processor
+        del self.tokenizer
+        self.model = None
+        self.processor = None
+        self.tokenizer = None
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
+        self._is_loaded = False
 
     @abc.abstractmethod
     def prepare_inputs(self, image: torch.Tensor, text: str) -> dict[str, torch.Tensor]:

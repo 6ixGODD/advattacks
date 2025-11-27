@@ -57,23 +57,6 @@ class QwenWrapper(Wrapper):
         self.model.eval()
         self._is_loaded = True
 
-    def unload(self) -> None:
-        """Unload model and free GPU memory."""
-        if not self._is_loaded:
-            return
-
-        del self.model
-        del self.processor
-        del self.tokenizer
-        self.model = None
-        self.processor = None
-        self.tokenizer = None
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        self._is_loaded = False
-
     def prepare_inputs(self, image: torch.Tensor, text: str) -> dict[str, torch.Tensor]:
         """Prepare inputs for Qwen2.5-VL model.
 
@@ -116,7 +99,10 @@ class QwenWrapper(Wrapper):
         return {k: v.to(self.device) for k, v in inputs.items()}
 
     def prepare_tf_inputs(
-        self, image: torch.Tensor, question: str, target_prefix: str
+        self,
+        image: torch.Tensor,
+        question: str,
+        target_prefix: str,
     ) -> dict[str, torch.Tensor]:
         """Prepare inputs for teacher-forcing loss computation.
 
