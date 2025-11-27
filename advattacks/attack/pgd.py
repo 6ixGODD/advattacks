@@ -33,8 +33,6 @@ class PGD(Attack):
         prefixes: Sequence of target prefix strings for jailbreak.
     """
 
-    MAX_CONCURRENT_PREFIXES = 5
-
     def __init__(
         self,
         wrappers: t.Sequence[Wrapper],
@@ -68,6 +66,10 @@ class PGD(Attack):
         large perturbations:
             L = (1/K) * Σ L_tf(prefix_k) + λ_inf * ||x - x_0||_inf
 
+        Uses proper tensor arithmetic to maintain gradient flow throughout
+        the computation. Each prefix contributes to the total loss via
+        differentiable tensor operations.
+
         Args:
             image: Current perturbed image.
             original_image: Original clean image.
@@ -75,43 +77,38 @@ class PGD(Attack):
             wrapper: Model wrapper to compute loss with.
 
         Returns:
-            Scalar composite loss tensor.
+            Scalar composite loss tensor with maintained gradient flow.
         """
-        total_tfloss = 0.0
+        # Initialize total loss as tensor (not scalar) to maintain gradients
+        total_tfloss = torch.tensor(0.0, device=image.device)
         valid_prefixes = 0
 
-        for i in range(0, len(self.prefixes), self.MAX_CONCURRENT_PREFIXES):
-            batch_prefixes = self.prefixes[i : i + self.MAX_CONCURRENT_PREFIXES]
+        # Compute teacher-forcing loss for each target prefix
+        for prefix in self.prefixes:
+            try:
+                tfloss = wrapper.compute_tfloss(image, question, prefix)
+                # Keep tensor arithmetic - do NOT use .item()!
+                total_tfloss = total_tfloss + tfloss
+                valid_prefixes += 1
 
-            for prefix in batch_prefixes:
-                try:
-                    tfloss = wrapper.compute_tfloss(image, question, prefix)
-                    total_tfloss += tfloss.item()
-                    valid_prefixes += 1
+            except torch.cuda.OutOfMemoryError:
+                print(f"Warning: OOM for prefix '{prefix}', skipping...")
+                torch.cuda.empty_cache()
+                continue
+            except Exception as e:
+                print(f"Warning: Failed to compute loss for prefix '{prefix}': {e}")
+                continue
 
-                    del tfloss
-
-                except torch.cuda.OutOfMemoryError:
-                    print(f"Warning: OOM for prefix '{prefix}', skipping...")
-                    torch.cuda.empty_cache()
-                    continue
-                except Exception as e:
-                    print(f"Warning: Failed to compute loss for prefix '{prefix}': {e}")
-                    continue
-
-            torch.cuda.empty_cache()
-
-        # Batch average teacher-forcing loss
+        # Average teacher-forcing loss (maintain tensor operations)
         if valid_prefixes > 0:
-            avg_tfloss = torch.tensor(
-                total_tfloss / valid_prefixes, device=image.device, requires_grad=True
-            )
+            avg_tfloss = total_tfloss / valid_prefixes
         else:
-            avg_tfloss = torch.tensor(0.0, device=image.device, requires_grad=True)
+            avg_tfloss = torch.tensor(0.0, device=image.device)
 
-        # L-infinity penalty
+        # L-infinity regularization penalty
         linf_penalty = torch.norm(image - original_image, p=float("inf"))
 
+        # Composite loss with proper weighting
         return avg_tfloss + self.lambda_inf * linf_penalty
 
     def _pgd_step(
@@ -121,10 +118,12 @@ class PGD(Attack):
         question: str,
         wrapper: Wrapper,
     ) -> torch.Tensor:
-        """Perform a single PGD update step.
+        """Perform a single PGD update step with proper gradient
+        computation.
 
         Computes gradient of composite loss w.r.t.image and applies PGD update
-        with projection to epsilon-ball and valid pixel range.
+        with projection to epsilon-ball and valid pixel range. Includes gradient
+        debugging information to monitor optimization progress.
 
         Args:
             image: Current perturbed image.
@@ -139,17 +138,26 @@ class PGD(Attack):
         image_adv = image.clone().detach().requires_grad_(True)
 
         try:
-            # Compute composite loss
+            # Compute composite loss with maintained gradient flow
             loss = self._compute_composite_loss(image_adv, original_image, question, wrapper)
 
-            # Compute gradient
+            # Debug: Check loss properties
+            # print(f"Loss value: {loss.item():.6f}, requires_grad: {loss.requires_grad}")
+
+            # Compute gradient w.r.t. adversarial image
             grad = torch.autograd.grad(loss, image_adv, create_graph=False)[0]
 
-            # PGD update
+            # Debug: Check gradient properties
+            grad_norm = torch.norm(grad).item()
+            # print(f"Gradient norm: {grad_norm:.6f}")
+            # if grad_norm < 1e-8:
+            #     print("WARNING: Gradient is near zero - no effective update!")
+
+            # PGD update: x - alpha * sign(∇L)
             normalized_grad = utils.normalize_gradient(grad)
             image_updated = image_adv - self.alpha * normalized_grad
 
-            # Project back to constraints
+            # Project back to epsilon-ball and valid pixel range [0, 1]
             image_projected = utils.project_linf(
                 image_updated,
                 original_image,
@@ -159,6 +167,7 @@ class PGD(Attack):
             result = image_projected.detach()
 
         finally:
+            # Clean up intermediate variables
             if "loss" in locals():
                 del loss
             if "grad" in locals():
@@ -171,15 +180,19 @@ class PGD(Attack):
                 del image_updated
             if "image_projected" in locals():
                 del image_projected
-            torch.cuda.empty_cache()
+
         return result
 
     def attack(self, image: torch.Tensor, text: str, verbose: bool = True) -> torch.Tensor:
         """Run PGD attack with round-robin model loading.
 
         Performs multi-round optimization across all models using sequential
-        loading to minimize memory usage. Each model is loaded, optimized for
+        loading to minimize memory usage.Each model is loaded, optimized for
         several steps, then unloaded before moving to the next.
+
+        The attack alternates between models to encourage cross-model transferable
+        adversarial perturbations while maintaining memory efficiency through
+        the round-robin loading strategy.
 
         Args:
             image: Original clean image tensor of shape (C, H, W) in [0, 1] range.
@@ -187,7 +200,8 @@ class PGD(Attack):
             verbose: Whether to print progress information.
 
         Returns:
-            Adversarial image tensor with same shape as input.
+            Adversarial image tensor with same shape as input, satisfying
+            L-infinity constraint and pixel value bounds.
         """
         original_image = image.clone().detach()
         x = original_image.clone()
@@ -207,12 +221,18 @@ class PGD(Attack):
 
                 # Perform PGD steps for this model
                 for _ in range(self.steps_per_model):
+                    x_prev = x.clone()
                     x = self._pgd_step(x, original_image, text, wrapper)
                     current_step += 1
 
                     if verbose:
                         linf_norm = torch.norm(x - original_image, p=float("inf")).item()
-                        print(f"    Step {current_step}/{total_steps} | L∞: {linf_norm:.6f}")
+                        step_change = torch.norm(x - x_prev, p=float("inf")).item()
+                        print(
+                            f"    Step {current_step}/{total_steps} | "
+                            f"L∞: {linf_norm:.6f} | "
+                            f"Δ: {step_change:.6f}"
+                        )
 
                 # Unload model and free memory
                 if verbose:
