@@ -48,8 +48,10 @@ class LlavaWrapper(Wrapper):
 
         del self.model
         del self.processor
+        del self.tokenizer
         self.model = None
         self.processor = None
+        self.tokenizer = None
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -57,15 +59,7 @@ class LlavaWrapper(Wrapper):
         self._is_loaded = False
 
     def prepare_inputs(self, image: torch.Tensor, text: str) -> dict[str, torch.Tensor]:
-        """Prepare inputs for LLaVA.
-
-        Args:
-            image: Image tensor of shape (C, H, W) in [0, 1] range.
-            text: Text prompt.
-
-        Returns:
-            Dictionary of model inputs.
-        """
+        """Prepare inputs for LLaVA."""
         if not self._is_loaded:
             raise RuntimeError("Model not loaded. Call load() first.")
         if not self.processor:
@@ -91,23 +85,62 @@ class LlavaWrapper(Wrapper):
 
         return {k: v.to(self.device) for k, v in inputs.items()}
 
+    def prepare_tf_inputs(
+        self, image: torch.Tensor, question: str, target_prefix: str
+    ) -> dict[str, torch.Tensor]:
+        """Prepare inputs for teacher-forcing with correct labels."""
+        if not self._is_loaded or not self.processor or not self.tokenizer:
+            raise RuntimeError("Model not loaded or components not initialized.")
+
+        # 1. Tokenize target prefix to determine lengths
+        prefix_tokens = self.tokenizer(target_prefix, add_special_tokens=False)["input_ids"]
+
+        # 2. Construct conversation with both user and assistant parts
+        conversation = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": question},
+                    {"type": "image"},
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": target_prefix,  # Target response
+            },
+        ]
+
+        # 3. Apply chat template without generation prompt (we have complete conversation)
+        prompt = self.processor.apply_chat_template(conversation, add_generation_prompt=False)
+
+        # 4. Process inputs
+        inputs = self.processor(
+            images=image,
+            text=prompt,
+            do_rescale=False,
+            return_tensors="pt",
+        )
+
+        # 5. Construct labels for teacher-forcing
+        input_ids = inputs["input_ids"][0]  # 移除batch维度
+        labels = input_ids.clone()
+
+        # 6. Mask non-target tokens with -100
+        prefix_len = len(prefix_tokens)
+        labels[:-prefix_len] = -100  # Mask all except target tokens
+
+        # 7. Add batch dimension back
+        inputs["labels"] = labels.unsqueeze(0)
+
+        return {k: v.to(self.device) for k, v in inputs.items()}
+
     def forward(
         self,
         image: torch.Tensor,
         text: str,
         target_ids: t.Optional[torch.Tensor] = None,  # noqa
     ) -> t.Union[torch.Tensor, t.Tuple[torch.Tensor, torch.Tensor]]:  # noqa
-        """Forward pass through LLaVA.
-
-        Args:
-            image: Image tensor of shape (C, H, W) in [0, 1] range.
-            text: Text prompt.
-            target_ids: Target token IDs for loss computation.
-
-        Returns:
-            If target_ids is None: logits tensor.
-            If target_ids is provided: tuple of (loss, logits).
-        """
+        """Forward pass through LLaVA."""
         if not self._is_loaded:
             raise RuntimeError("Model not loaded. Call load() first.")
         if not self.model:
@@ -124,43 +157,17 @@ class LlavaWrapper(Wrapper):
             return outputs.loss, outputs.logits
         return outputs.logits
 
-    def compute_loss(
+    def compute_tfloss(
         self,
         image: torch.Tensor,
-        text: str,
-        target_ids: torch.Tensor,
+        question: str,
+        target_prefix: str,
     ) -> torch.Tensor:
-        loss, _ = self.forward(image, text, target_ids)
-        return loss
+        """Compute teacher-forcing loss for LLaVA."""
+        if not self._is_loaded or not self.model:
+            raise RuntimeError("Model not loaded or not initialized.")
 
-    def compute_gradient(
-        self,
-        image: torch.Tensor,
-        text: str,
-        target_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        image_adv = image.clone().detach().requires_grad_(True)
-        loss = self.compute_loss(image_adv, text, target_ids)
-        return torch.autograd.grad(loss, image_adv)[0]
+        inputs = self.prepare_tf_inputs(image, question, target_prefix)
+        outputs = self.model(**inputs)
 
-    def generate(
-        self,
-        image: torch.Tensor,
-        text: str,
-        max_new_tokens: int = 1024,
-        temperature: float = 0.2,
-    ) -> str:
-        if not self._is_loaded:
-            raise RuntimeError("Model not loaded. Call load() first.")
-
-        inputs = self.prepare_inputs(image, text)
-
-        with torch.no_grad():
-            generate_ids = self.model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=True,
-                temperature=temperature,
-            )
-
-        return self.processor.decode(generate_ids[0], skip_special_tokens=True)
+        return outputs.loss

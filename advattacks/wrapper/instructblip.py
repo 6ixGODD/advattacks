@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pathlib
+import typing as t
 
 import torch
 import transformers as tfs
@@ -9,14 +10,28 @@ from advattacks.wrapper import Wrapper
 
 
 class InstructBlipWrapper(Wrapper):
+    """Wrapper for Salesforce InstructBLIP-Vicuna-7B model.
+
+    InstructBLIP combines BLIP-2 with Vicuna language model for instruction-following
+    visual question answering. It uses a Q-Former to bridge vision and language
+    representations.
+
+    Attributes:
+        model: The InstructBLIP conditional generation model.
+        processor: InstructBLIP processor for input preparation and decoding.
+        tokenizer: GPT-2 based tokenizer used by InstructBLIP.
+    """
+
     model: tfs.InstructBlipForConditionalGeneration | None
     processor: tfs.InstructBlipProcessor | None
-    tokenizer: tfs.GPT2Tokenizer | None  # InstructBlip uses GPT2Tokenizer
+    tokenizer: tfs.GPT2Tokenizer | None
 
     def __init__(self, model_path: str | pathlib.Path, device: torch.device | None = None):
         super().__init__(model_path, device)
 
     def load(self) -> None:
+        """Load InstructBLIP model, processor, and tokenizer into
+        memory."""
         if self._is_loaded:
             return
 
@@ -41,13 +56,16 @@ class InstructBlipWrapper(Wrapper):
         self._is_loaded = True
 
     def unload(self) -> None:
+        """Unload model and free GPU memory."""
         if not self._is_loaded:
             return
 
         del self.model
         del self.processor
+        del self.tokenizer
         self.model = None
         self.processor = None
+        self.tokenizer = None
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -55,14 +73,20 @@ class InstructBlipWrapper(Wrapper):
         self._is_loaded = False
 
     def prepare_inputs(self, image: torch.Tensor, text: str) -> dict[str, torch.Tensor]:
-        """Prepare inputs for InstructBLIP.
+        """Prepare inputs for InstructBLIP model.
+
+        InstructBLIP uses a simple text prompt format without complex chat templates.
+        The processor handles image preprocessing and text tokenization.
 
         Args:
             image: Image tensor of shape (C, H, W) in [0, 1] range.
-            text: Text prompt.
+            text: Text prompt/instruction.
 
         Returns:
-            Dictionary of model inputs.
+            Dictionary containing 'input_ids', 'attention_mask', and 'pixel_values'.
+
+        Raises:
+            RuntimeError: If model is not loaded or processor is not initialized.
         """
         if not self._is_loaded:
             raise RuntimeError("Model not loaded. Call load() first.")
@@ -79,25 +103,81 @@ class InstructBlipWrapper(Wrapper):
 
         return {k: v.to(self.device) for k, v in inputs.items()}
 
+    def prepare_tf_inputs(
+        self, image: torch.Tensor, question: str, target_prefix: str
+    ) -> dict[str, torch.Tensor]:
+        """Prepare inputs for teacher-forcing loss computation.
+
+        For InstructBLIP, we construct the input by concatenating the question
+        with the target prefix. Since InstructBLIP doesn't use complex chat
+        templates, we directly append the target to the question.
+
+        Args:
+            image: Image tensor of shape (C, H, W) in [0, 1] range.
+            question: The input question/instruction.
+            target_prefix: Target response prefix (e.g., "Sure, here is how to").
+
+        Returns:
+            Dictionary containing model inputs with proper labels for loss computation.
+
+        Raises:
+            RuntimeError: If model components are not loaded/initialized.
+        """
+        if not self._is_loaded or not self.processor or not self.tokenizer:
+            raise RuntimeError("Model not loaded or components not initialized.")
+
+        # 1. Tokenize target prefix to determine lengths
+        prefix_tokens = self.tokenizer(target_prefix, add_special_tokens=False)["input_ids"]
+
+        # 2. Construct full sequence: question + space + target prefix
+        full_text = question + " " + target_prefix
+
+        # 3. Process the full sequence with image
+        inputs = self.processor(
+            images=image,
+            text=full_text,
+            padding=True,
+            padding_side="left",
+            return_tensors="pt",
+        )
+
+        # 4.  Construct labels for teacher-forcing
+        input_ids = inputs["input_ids"][0]  # Remove batch dimension
+        labels = input_ids.clone()
+
+        # 5. Mask question part with -100 (don't compute loss on input)
+        # Only compute loss on the target prefix tokens at the end
+        prefix_len = len(prefix_tokens)
+        if prefix_len < len(labels):
+            labels[:-prefix_len] = -100  # Mask all tokens except target prefix
+
+        # 6. Add batch dimension back
+        inputs["labels"] = labels.unsqueeze(0)
+
+        return {k: v.to(self.device) for k, v in inputs.items()}
+
     def forward(
         self,
         image: torch.Tensor,
         text: str,
         target_ids: t.Optional[torch.Tensor] = None,  # noqa
     ) -> t.Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:  # noqa
-        """Forward pass through InstructBLIP.
+        """Forward pass through InstructBLIP model.
 
         Args:
             image: Image tensor of shape (C, H, W) in [0, 1] range.
-            text: Text prompt.
-            target_ids: Target token IDs for loss computation.
+            text: Text prompt/instruction.
+            target_ids: Optional target token IDs for loss computation (legacy interface).
 
         Returns:
-            If target_ids is None: logits tensor.
+            If target_ids is None: logits tensor of shape (batch_size, seq_len, vocab_size).
             If target_ids is provided: tuple of (loss, logits).
+
+        Raises:
+            RuntimeError: If model is not loaded or initialized.
         """
         if not self._is_loaded:
-            raise RuntimeError("Model not loaded. Call load() first.")
+            raise RuntimeError("Model not loaded.  Call load() first.")
         if not self.model:
             raise RuntimeError("Model not initialized.")
 
@@ -112,43 +192,32 @@ class InstructBlipWrapper(Wrapper):
             return outputs.loss, outputs.logits
         return outputs.logits
 
-    def compute_loss(
+    def compute_tfloss(
         self,
         image: torch.Tensor,
-        text: str,
-        target_ids: torch.Tensor,
+        question: str,
+        target_prefix: str,
     ) -> torch.Tensor:
-        loss, _ = self.forward(image, text, target_ids)
-        return loss
+        """Compute teacher-forcing loss for InstructBLIP.
 
-    def compute_gradient(
-        self,
-        image: torch.Tensor,
-        text: str,
-        target_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        image_adv = image.clone().detach().requires_grad_(True)
-        loss = self.compute_loss(image_adv, text, target_ids)
-        return torch.autograd.grad(loss, image_adv)[0]
+        This method constructs proper input-output pairs and computes the loss
+        only on the target prefix tokens, not the entire sequence.
 
-    def generate(
-        self,
-        image: torch.Tensor,
-        text: str,
-        max_new_tokens: int = 1024,
-        temperature: float = 0.2,
-    ) -> str:
-        if not self._is_loaded:
-            raise RuntimeError("Model not loaded. Call load() first.")
+        Args:
+            image: Image tensor of shape (C, H, W) in [0, 1] range.
+            question: The input question/instruction.
+            target_prefix: Target response prefix to optimize for.
 
-        inputs = self.prepare_inputs(image, text)
+        Returns:
+            Scalar tensor representing the teacher-forcing loss.
 
-        with torch.no_grad():
-            generate_ids = self.model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=True,
-                temperature=temperature,
-            )
+        Raises:
+            RuntimeError: If model is not loaded or initialized.
+        """
+        if not self._is_loaded or not self.model:
+            raise RuntimeError("Model not loaded or not initialized.")
 
-        return self.processor.decode(generate_ids[0], skip_special_tokens=True)
+        inputs = self.prepare_tf_inputs(image, question, target_prefix)
+        outputs = self.model(**inputs)
+
+        return outputs.loss

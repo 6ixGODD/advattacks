@@ -58,12 +58,10 @@ class Wrapper(abc.ABC):
     @abc.abstractmethod
     def load(self) -> None:
         """Load model and processor into memory."""
-        pass
 
     @abc.abstractmethod
     def unload(self) -> None:
         """Unload model and free GPU memory."""
-        pass
 
     @abc.abstractmethod
     def prepare_inputs(self, image: torch.Tensor, text: str) -> dict[str, torch.Tensor]:
@@ -76,7 +74,24 @@ class Wrapper(abc.ABC):
         Returns:
             Dictionary of model inputs.
         """
-        pass
+
+    @abc.abstractmethod
+    def prepare_tf_inputs(
+        self,
+        image: torch.Tensor,
+        question: str,
+        target_prefix: str,
+    ) -> dict[str, torch.Tensor]:
+        """Prepare inputs for teacher-forcing loss computation.
+
+        Args:
+            image: Image tensor of shape (C, H, W) in [0, 1] range.
+            question: Question/prompt text.
+            target_prefix: Target prefix string (e.g., "Sure, here is how to").
+
+        Returns:
+            Dictionary of model inputs.
+        """
 
     @abc.abstractmethod
     def forward(
@@ -96,7 +111,25 @@ class Wrapper(abc.ABC):
             If target_ids is None: logits tensor.
             If target_ids is provided: tuple of (loss, logits).
         """
-        pass
+
+    @abc.abstractmethod
+    def compute_tfloss(
+        self,
+        image: torch.Tensor,
+        question: str,
+        target_prefix: str,
+    ) -> torch.Tensor:
+        """Compute teacher-forcing loss for given inputs and target
+        prefix.
+
+        Args:
+            image: Image tensor of shape (C, H, W) in [0, 1] range.
+            question: Question/prompt text.
+            target_prefix: Target prefix string (e.g., "Sure, here is how to").
+
+        Returns:
+            Scalar teacher-forcing loss tensor.
+        """
 
     def compute_loss(
         self,
@@ -135,6 +168,26 @@ class Wrapper(abc.ABC):
         """
         image_adv = image.clone().detach().requires_grad_(True)
         loss = self.compute_loss(image_adv, text, target_ids)
+        return torch.autograd.grad(loss, image_adv)[0]
+
+    def compute_tf_gradient(
+        self,
+        image: torch.Tensor,
+        question: str,
+        target_prefix: str,
+    ) -> torch.Tensor:
+        """Compute gradient of teacher-forcing loss w.r.t. image.
+
+        Args:
+            image: Image tensor of shape (C, H, W) in [0, 1] range.
+            question: Question/prompt text.
+            target_prefix: Target prefix string.
+
+        Returns:
+            Gradient tensor of same shape as image.
+        """
+        image_adv = image.clone().detach().requires_grad_(True)
+        loss = self.compute_tfloss(image_adv, question, target_prefix)
         return torch.autograd.grad(loss, image_adv)[0]
 
     def generate(

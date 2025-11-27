@@ -10,6 +10,18 @@ from advattacks.wrapper import Wrapper
 
 
 class QwenWrapper(Wrapper):
+    """Wrapper for Qwen2. 5-VL-7B-Instruct vision-language model.
+
+    Qwen2.5-VL is Alibaba's latest vision-language model with strong capabilities
+    in image understanding and text generation.  It uses a transformer architecture
+    optimized for multimodal tasks.
+
+    Attributes:
+        model: The Qwen2.5-VL conditional generation model.
+        processor: Qwen2.5-VL processor for multimodal input handling.
+        tokenizer: Qwen2 tokenizer for text processing.
+    """
+
     model: tfs.Qwen2_5_VLForConditionalGeneration | None
     processor: tfs.Qwen2_5_VLProcessor | None
     tokenizer: tfs.Qwen2Tokenizer | None
@@ -18,6 +30,8 @@ class QwenWrapper(Wrapper):
         super().__init__(model_path, device)
 
     def load(self) -> None:
+        """Load Qwen2.5-VL model, processor, and tokenizer into
+        memory."""
         if self._is_loaded:
             return
 
@@ -44,13 +58,16 @@ class QwenWrapper(Wrapper):
         self._is_loaded = True
 
     def unload(self) -> None:
+        """Unload model and free GPU memory."""
         if not self._is_loaded:
             return
 
         del self.model
         del self.processor
+        del self.tokenizer
         self.model = None
         self.processor = None
+        self.tokenizer = None
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -58,14 +75,20 @@ class QwenWrapper(Wrapper):
         self._is_loaded = False
 
     def prepare_inputs(self, image: torch.Tensor, text: str) -> dict[str, torch.Tensor]:
-        """Prepare inputs for Qwen.
+        """Prepare inputs for Qwen2.5-VL model.
+
+        Qwen2. 5-VL uses a chat template format similar to other instruction-tuned
+        models. The processor handles both image and text input formatting.
 
         Args:
             image: Image tensor of shape (C, H, W) in [0, 1] range.
-            text: Text prompt.
+            text: Text prompt/instruction.
 
         Returns:
-            Dictionary of model inputs.
+            Dictionary containing tokenized inputs and processed image features.
+
+        Raises:
+            RuntimeError: If model is not loaded or processor is not initialized.
         """
         if not self._is_loaded:
             raise RuntimeError("Model not loaded. Call load() first.")
@@ -92,22 +115,92 @@ class QwenWrapper(Wrapper):
 
         return {k: v.to(self.device) for k, v in inputs.items()}
 
+    def prepare_tf_inputs(
+        self, image: torch.Tensor, question: str, target_prefix: str
+    ) -> dict[str, torch.Tensor]:
+        """Prepare inputs for teacher-forcing loss computation.
+
+        For Qwen2.5-VL, we use the chat template format to create a conversation
+        with both user message and assistant response. This ensures proper
+        formatting for teacher-forcing loss computation.
+
+        Args:
+            image: Image tensor of shape (C, H, W) in [0, 1] range.
+            question: The input question from user.
+            target_prefix: Target assistant response prefix.
+
+        Returns:
+            Dictionary containing model inputs with labels for loss computation.
+
+        Raises:
+            RuntimeError: If model components are not loaded/initialized.
+        """
+        if not self._is_loaded or not self.processor or not self.tokenizer:
+            raise RuntimeError("Model not loaded or components not initialized.")
+
+        # 1. Tokenize target prefix to determine lengths
+        prefix_tokens = self.tokenizer(target_prefix, add_special_tokens=False)["input_ids"]
+
+        # 2. Construct conversation with both user and assistant parts
+        conversation = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": question},
+                    {"type": "image"},
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": target_prefix,  # Target response
+            },
+        ]
+
+        # 3. Apply chat template without generation prompt (we have complete conversation)
+        prompt = self.processor.apply_chat_template(conversation, add_generation_prompt=False)
+
+        # 4. Process inputs
+        inputs = self.processor(
+            images=image,
+            text=prompt,
+            do_rescale=False,
+            return_tensors="pt",
+        )
+
+        # 5. Construct labels for teacher-forcing
+        input_ids = inputs["input_ids"][0]  # Remove batch dimension
+        labels = input_ids.clone()
+
+        # 6. Mask non-target tokens with -100
+        # For Qwen, we compute loss only on the assistant's response tokens
+        prefix_len = len(prefix_tokens)
+        if prefix_len < len(labels):
+            labels[:-prefix_len] = -100  # Mask all except target tokens
+
+        # 7. Add batch dimension back
+        inputs["labels"] = labels.unsqueeze(0)
+
+        return {k: v.to(self.device) for k, v in inputs.items()}
+
     def forward(
         self,
         image: torch.Tensor,
         text: str,
         target_ids: t.Optional[torch.Tensor] = None,  # noqa
     ) -> t.Union[torch.Tensor, t.Tuple[torch.Tensor, torch.Tensor]]:  # noqa
-        """Forward pass through Qwen.
+        """Forward pass through Qwen2.5-VL model.
 
         Args:
             image: Image tensor of shape (C, H, W) in [0, 1] range.
-            text: Text prompt.
-            target_ids: Target token IDs for loss computation.
+            text: Text prompt/instruction.
+            target_ids: Optional target token IDs for loss computation (legacy interface).
 
         Returns:
-            If target_ids is None: logits tensor.
+            If target_ids is None: logits tensor of shape (batch_size, seq_len, vocab_size).
             If target_ids is provided: tuple of (loss, logits).
+
+        Raises:
+            RuntimeError: If model is not loaded or initialized.
         """
         if not self._is_loaded:
             raise RuntimeError("Model not loaded. Call load() first.")
@@ -125,43 +218,32 @@ class QwenWrapper(Wrapper):
             return outputs.loss, outputs.logits
         return outputs.logits
 
-    def compute_loss(
+    def compute_tfloss(
         self,
         image: torch.Tensor,
-        text: str,
-        target_ids: torch.Tensor,
+        question: str,
+        target_prefix: str,
     ) -> torch.Tensor:
-        loss, _ = self.forward(image, text, target_ids)
-        return loss
+        """Compute teacher-forcing loss for Qwen2.5-VL.
 
-    def compute_gradient(
-        self,
-        image: torch.Tensor,
-        text: str,
-        target_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        image_adv = image.clone().detach().requires_grad_(True)
-        loss = self.compute_loss(image_adv, text, target_ids)
-        return torch.autograd.grad(loss, image_adv)[0]
+        Uses the chat template format to create proper conversation structure
+        and computes loss only on the assistant's response tokens.
 
-    def generate(
-        self,
-        image: torch.Tensor,
-        text: str,
-        max_new_tokens: int = 1024,
-        temperature: float = 0.2,
-    ) -> str:
-        if not self._is_loaded:
-            raise RuntimeError("Model not loaded. Call load() first.")
+        Args:
+            image: Image tensor of shape (C, H, W) in [0, 1] range.
+            question: The input question from user.
+            target_prefix: Target assistant response prefix to optimize for.
 
-        inputs = self.prepare_inputs(image, text)
+        Returns:
+            Scalar tensor representing the teacher-forcing loss.
 
-        with torch.no_grad():
-            generate_ids = self.model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=True,
-                temperature=temperature,
-            )
+        Raises:
+            RuntimeError: If model is not loaded or initialized.
+        """
+        if not self._is_loaded or not self.model:
+            raise RuntimeError("Model not loaded or not initialized.")
 
-        return self.processor.decode(generate_ids[0], skip_special_tokens=True)
+        inputs = self.prepare_tf_inputs(image, question, target_prefix)
+        outputs = self.model(**inputs)
+
+        return outputs.loss
