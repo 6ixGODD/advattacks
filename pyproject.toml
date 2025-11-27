@@ -21,11 +21,11 @@ classifiers = [
 dependencies = [
   "foolbox>=3.3,<4",
   "loguru>=0.7,<0.8",
+  "matplotlib>=3.10.7,<4",
   "pillow>=11,<13",
   "torch>=2.7,<3",
   "torchattacks>=3.5,<4",
   "torchvision>=0.22,<0.25",
-  "tqdm>=4.66,<5",
   "transformers>=4.57,<5",
 ]
 
