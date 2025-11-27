@@ -42,7 +42,7 @@ def load_dataset(data_dir: pathlib.Path, verbose: bool = True) -> list[DataSampl
             questions = json.load(f)
         scenario_img_dir = images_dir / scenario
         for question_id, question_data in questions.items():
-            image_path = scenario_img_dir / f"{question_id}.png"
+            image_path = scenario_img_dir / "SD" / f"{question_id}.png"
             if not image_path.exists():
                 if verbose:
                     print(f"Missing: {image_path}")
