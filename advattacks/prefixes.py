@@ -36,7 +36,7 @@ def tokenize_prefixes(prefixes: t.Sequence[str], wrapper: Wrapper) -> list[torch
     tokenized = []
 
     for prefix in prefixes:
-        # Use tokenizer from processor
+        # Use tokenizer
         tokens = wrapper.tokenizer(prefix, return_tensors="pt", add_special_tokens=False)
 
         # Extract token IDs and squeeze batch dimension
