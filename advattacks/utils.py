@@ -19,11 +19,12 @@ def project_linf(x: torch.Tensor, x_original: torch.Tensor, epsilon: float) -> t
     Returns:
         Projected image tensor.
     """
-    # Clip to epsilon ball
-    x_proj = torch.clamp(x, x_original - epsilon, x_original + epsilon)
+    # Compute bounds
+    lower_bound = torch.max(x_original - epsilon, torch.zeros_like(x_original))
+    upper_bound = torch.min(x_original + epsilon, torch.ones_like(x_original))
 
-    # Clip to valid pixel range
-    return torch.clamp(x_proj, 0.0, 1.0)
+    # Project into bounds
+    return torch.clamp(x, lower_bound, upper_bound)
 
 
 def normalize_gradient(grad: torch.Tensor) -> torch.Tensor:
